@@ -4,24 +4,24 @@ FROM python:3.11-slim
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies needed for building some Python packages
+# Install system dependencies required for building Python packages
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install Python dependencies with pip
+# Copy requirements and install Python dependencies
 COPY requirements.txt .
-
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the application code
+# Copy application source code
 COPY . .
 
-# Create necessary directories for your app’s data
-RUN mkdir -p data/pdfs data/vector_store
+# Create necessary directories for file uploads and persistence
+RUN mkdir -p data/pdfs data/vector_store \
+    && chmod -R 777 data
 
-# Expose Streamlit port
+# Expose the port Streamlit app uses
 EXPOSE 8501
 
-# Run Streamlit app, listening on all interfaces so accessible externally
+# Run the Streamlit app and make it accessible externally
 CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
