@@ -1,0 +1,72 @@
+version: '3.8'
+
+services:
+  rag-chatbot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag-pdf-chatbot
+    ports:
+      - "8501:8501"
+    environment:
+      # OpenAI API Configuration (required)
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      
+      # Optional Model Configuration
+      - LLM_MODEL=${LLM_MODEL:-gpt-3.5-turbo}
+      - TEMPERATURE=${TEMPERATURE:-0.3}
+      - MAX_TOKENS=${MAX_TOKENS:-500}
+      
+      # Optional Retrieval Configuration
+      - CHUNK_SIZE=${CHUNK_SIZE:-1000}
+      - CHUNK_OVERLAP=${CHUNK_OVERLAP:-200}
+      - RETRIEVAL_TOP_K=${RETRIEVAL_TOP_K:-4}
+      
+      # Vector Store Configuration
+      - VECTOR_STORE_PATH=${VECTOR_STORE_PATH:-./data/vector_store}
+      
+      # Streamlit Configuration
+      - STREAMLIT_SERVER_PORT=8501
+      - STREAMLIT_SERVER_ADDRESS=0.0.0.0
+      - STREAMLIT_SERVER_HEADLESS=true
+      - STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+      
+      # Logging
+      - PYTHONUNBUFFERED=1
+    volumes:
+      # Persist uploaded PDFs
+      - ./data/pdfs:/app/data/pdfs
+      # Persist vector store
+      - ./data/vector_store:/app/data/vector_store
+      # Mount .env file for local development
+      - ./.env:/app/.env:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8501/_stcore/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - rag-network
+
+  # Optional: Add a watchtower service for automatic updates (commented out by default)
+  # watchtower:
+  #   image: containrrr/watchtower
+  #   container_name: watchtower
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock
+  #   environment:
+  #     - WATCHTOWER_POLL_INTERVAL=86400  # Check for updates every 24 hours
+  #     - WATCHTOWER_CLEANUP=true
+  #   restart: unless-stopped
+  #   networks:
+  #     - rag-network
+
+networks:
+  rag-network:
+    driver: bridge
+
+volumes:
+  pdf-data:
+  vector-store-data:

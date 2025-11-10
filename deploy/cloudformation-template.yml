@@ -1,0 +1,574 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'RAG PDF Chatbot - Production deployment with EC2, S3, EFS, and Secrets Manager'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ragbot
+    Description: Project name for resource naming
+    AllowedPattern: '^[a-z0-9-]+$'
+  
+  Environment:
+    Type: String
+    Default: production
+    Description: Environment name
+    AllowedValues:
+      - production
+      - staging
+      - development
+  
+  OpenAIApiKey:
+    Type: String
+    NoEcho: true
+    Description: OpenAI API key (will be stored in Secrets Manager)
+  
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    Description: EC2 instance type
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t3.micro
+      - t3.small
+      - t3.medium
+  
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair for SSH access
+  
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID for deployment
+  
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet ID for EC2 instance
+  
+  AllowedIpRange:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: IP range allowed to access the application
+    AllowedPattern: '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$'
+  
+  EnableVersioning:
+    Type: String
+    Default: true
+    Description: Enable S3 versioning
+    AllowedValues:
+      - true
+      - false
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, production]
+
+Resources:
+  # S3 Bucket for PDF Storage
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-pdfs-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: !If [IsProduction, Enabled, Suspended]
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: STANDARD_IA
+            NoncurrentVersionTransitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+            NoncurrentVersionExpirationInDays: 365
+  
+  # S3 Bucket for Access Logs
+  S3LoggingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-logs-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+  
+  # Enable logging on main bucket
+  S3BucketLogging:
+    Type: AWS::S3::BucketLogging
+    Properties:
+      BucketName: !Ref S3Bucket
+      LoggingConfiguration:
+        DestinationBucketName: !Ref S3LoggingBucket
+        LogFilePrefix: s3-access-logs/
+  
+  # EFS File System for Vector Store
+  EFSFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      PerformanceMode: generalPurpose
+      ThroughputMode: bursting
+      Encrypted: true
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vector-store'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+      LifecyclePolicies:
+        - TransitionToIA: AFTER_30_DAYS
+  
+  # EFS Mount Target
+  EFSMountTarget:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Ref SubnetId
+      SecurityGroups:
+        - !Ref EFSecurityGroup
+  
+  # EFS Access Point for Vector Store
+  EFSAccessPointVectorStore:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      PosixUser:
+        Uid: 1000
+        Gid: 1000
+      RootDirectory:
+        Path: /vector_store
+        CreationInfo:
+          OwnerUid: 1000
+          OwnerGid: 1000
+          Permissions: '755'
+  
+  # EFS Access Point for PDFs
+  EFSAccessPointPDFs:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      PosixUser:
+        Uid: 1000
+        Gid: 1000
+      RootDirectory:
+        Path: /pdfs
+        CreationInfo:
+          OwnerUid: 1000
+          OwnerGid: 1000
+          Permissions: '755'
+  
+  # Secrets Manager Secret for OpenAI API Key
+  OpenAIAPISecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}/openai-api-key'
+      Description: OpenAI API key for RAG PDF Chatbot
+      SecretString: !Sub '{"OPENAI_API_KEY":"${OpenAIApiKey}"}'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+  
+  # IAM Role for EC2 Instance
+  EC2IAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-ec2-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/SecretsManagerReadWrite
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-efs-access'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticfilesystem:ClientMount
+                  - elasticfilesystem:ClientWrite
+                  - elasticfilesystem:ClientRootAccess
+                Resource: !GetAtt EFSFileSystem.Arn
+  
+  # IAM Instance Profile
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${ProjectName}-ec2-instance-profile'
+      Roles:
+        - !Ref EC2IAMRole
+  
+  # Security Group for EC2
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-ec2-sg'
+      GroupDescription: Security group for RAG PDF Chatbot EC2 instance
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedIpRange
+          Description: SSH access
+        - IpProtocol: tcp
+          FromPort: 8501
+          ToPort: 8501
+          CidrIp: 0.0.0.0/0
+          Description: Streamlit application
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ec2-sg'
+  
+  # Security Group for EFS
+  EFSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-efs-sg'
+      GroupDescription: Security group for RAG PDF Chatbot EFS
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+          Description: NFS access from EC2
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-efs-sg'
+  
+  # EC2 Instance
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64}}'
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      SubnetId: !Ref SubnetId
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 20
+            VolumeType: gp3
+            Encrypted: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          
+          # Configuration
+          PROJECT_NAME="${ProjectName}"
+          AWS_REGION="${AWS::Region}"
+          S3_BUCKET="${S3Bucket}"
+          EFS_ID="${EFSFileSystem}"
+          SECRET_NAME="${OpenAIAPISecret}"
+          
+          # Update system
+          yum update -y
+          
+          # Install packages
+          yum install -y python3.11 python3.11-pip git amazon-efs-utils aws-cli cloud-init
+          
+          # Install Docker
+          yum install -y docker
+          systemctl start docker
+          systemctl enable docker
+          
+          # Create application user
+          useradd -m -s /bin/bash ragbot
+          
+          # Create directories
+          mkdir -p /opt/ragbot
+          mkdir -p /mnt/efs
+          mkdir -p /var/log/ragbot
+          
+          # Mount EFS
+          echo "${EFSFileSystem}:/ /mnt/efs efs defaults,_netdev,tls 0 0" >> /etc/fstab
+          mount -a
+          
+          # Set permissions
+          chown -R ragbot:ragbot /opt/ragbot
+          chown -R ragbot:ragbot /mnt/efs
+          
+          # Switch to ragbot user for application setup
+          sudo -u ragbot bash << 'EOF'
+          
+          # Clone repository
+          cd /opt/ragbot
+          git clone https://github.com/yourusername/v3_RAGBOT.git .
+          
+          # Create Python virtual environment
+          python3.11 -m venv venv
+          source venv/bin/activate
+          
+          # Install dependencies
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install boto3 botocore
+          
+          # Create environment file
+          cat > .env << 'ENVEOF'
+          AWS_REGION=${AWS::Region}
+          S3_BUCKET=${S3Bucket}
+          EFS_MOUNT_POINT=/mnt/efs
+          VECTOR_STORE_PATH=/mnt/efs/vector_store
+          PDF_STORAGE_DIR=/mnt/efs/pdfs
+          SECRET_NAME=${OpenAIAPISecret}
+          LOG_LEVEL=INFO
+          ENALE_METRICS=true
+          ENVEOF
+          
+          # Download existing data from S3 if available
+          aws s3 sync s3://${S3Bucket}/vector_store/ /mnt/efs/vector_store/ --region ${AWS::Region}
+          aws s3 sync s3://${S3Bucket}/pdfs/ /mnt/efs/pdfs/ --region ${AWS::Region}
+          
+          EOF
+          
+          # Create systemd service
+          cat > /etc/systemd/system/ragbot.service << 'SERVICEEOF'
+          [Unit]
+          Description=RAG PDF Chatbot
+          After=network.target
+          Wants=network.target
+          
+          [Service]
+          Type=simple
+          User=ragbot
+          Group=ragbot
+          WorkingDirectory=/opt/ragbot
+          Environment=PATH=/opt/ragbot/venv/bin
+          Environment=PYTHONUNBUFFERED=1
+          ExecStartPre=/bin/sleep 30
+          ExecStart=/opt/ragbot/venv/bin/streamlit run app.py \
+              --server.port=8501 \
+              --server.address=0.0.0.0 \
+              --server.headless=true \
+              --server.enableCORS=false \
+              --server.enableXsrfProtection=false \
+              --server.maxUploadSize=50 \
+              --server.maxMessageSize=50
+          Restart=always
+          RestartSec=10
+          StandardOutput=append:/var/log/ragbot/app.log
+          StandardError=append:/var/log/ragbot/error.log
+          
+          [Install]
+          WantedBy=multi-user.target
+          SERVICEEOF
+          
+          # Setup CloudWatch agent
+          yum install -y amazon-cloudwatch-agent
+          
+          cat > /opt/aws/amazon-cloudwatch-agent/etc/config.json << 'CWCONFIGEOF'
+          {
+              "agent": {
+                  "metrics_collection_interval": 60,
+                  "run_as_user": "root"
+              },
+              "metrics": {
+                  "namespace": "RAGBot",
+                  "metrics_collected": {
+                      "cpu": {
+                          "measurement": ["cpu_usage_idle", "cpu_usage_iowait", "cpu_usage_user", "cpu_usage_system"],
+                          "metrics_collection_interval": 60,
+                          "totalcpu": false
+                      },
+                      "disk": {
+                          "measurement": ["used_percent", "inodes_free"],
+                          "metrics_collection_interval": 60,
+                          "resources": ["*"]
+                      },
+                      "mem": {
+                          "measurement": ["mem_used_percent"],
+                          "metrics_collection_interval": 60
+                      },
+                      "swap": {
+                          "measurement": ["swap_used_percent"],
+                          "metrics_collection_interval": 60
+                      }
+                  }
+              },
+              "logs": {
+                  "logs_collected": {
+                      "files": {
+                          "collect_list": [
+                              {
+                                  "file_path": "/var/log/ragbot/app.log",
+                                  "log_group_name": "${ProjectName}-application",
+                                  "log_stream_name": "{instance_id}",
+                                  "retention_in_days": 7
+                              },
+                              {
+                                  "file_path": "/var/log/ragbot/error.log",
+                                  "log_group_name": "${ProjectName}-errors",
+                                  "log_stream_name": "{instance_id}",
+                                  "retention_in_days": 7
+                              }
+                          ]
+                      }
+                  }
+              }
+          }
+          CWCONFIGEOF
+          
+          # Enable and start services
+          systemctl enable amazon-cloudwatch-agent
+          systemctl start amazon-cloudwatch-agent
+          systemctl daemon-reload
+          systemctl enable ragbot.service
+          systemctl start ragbot.service
+          
+          # Create log rotation
+          cat > /etc/logrotate.d/ragbot << 'LOGROTATEEOF'
+          /var/log/ragbot/*.log {
+              daily
+              missingok
+              rotate 7
+              compress
+              delaycompress
+              notifempty
+              create 0640 ragbot ragbot
+              sharedscripts
+              postrotate
+                  systemctl reload ragbot > /dev/null 2>&1 || true
+              endscript
+          }
+          LOGROTATEEOF
+          
+          echo "Setup completed successfully"
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-instance'
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+  
+  # CloudWatch Alarm for CPU
+  CPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-high-cpu'
+      AlarmDescription: CPU utilization is high
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref EC2Instance
+      AlarmActions:
+        - !Ref SNSNotificationTopic
+  
+  # CloudWatch Alarm for Memory
+  MemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-high-memory'
+      AlarmDescription: Memory utilization is high
+      MetricName: mem_used_percent
+      Namespace: CWAgent
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref EC2Instance
+      AlarmActions:
+        - !Ref SNSNotificationTopic
+  
+  # SNS Topic for Notifications
+  SNSNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-alerts'
+      DisplayName: !Sub '${ProjectName} Alerts'
+  
+  # SNS Topic Policy
+  SNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref SNSNotificationTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref SNSNotificationTopic
+
+Outputs:
+  ApplicationURL:
+    Description: URL of the RAG PDF Chatbot application
+    Value: !Sub 'http://${EC2Instance.PublicIp}:8501'
+    Export:
+      Name: !Sub '${ProjectName}-application-url'
+  
+  S3BucketName:
+    Description: S3 bucket for PDF storage
+    Value: !Ref S3Bucket
+    Export:
+      Name: !Sub '${ProjectName}-s3-bucket'
+  
+  EFSFileSystemId:
+    Description: EFS file system ID
+    Value: !Ref EFSFileSystem
+    Export:
+      Name: !Sub '${ProjectName}-efs-id'
+  
+  SecretName:
+    Description: Secrets Manager secret name
+    Value: !Ref OpenAIAPISecret
+    Export:
+      Name: !Sub '${ProjectName}-secret-name'
+  
+  InstanceId:
+    Description: EC2 instance ID
+    Value: !Ref EC2Instance
+    Export:
+      Name: !Sub '${ProjectName}-instance-id'
+  
+  SNSNotificationTopic:
+    Description: SNS topic for notifications
+    Value: !Ref SNSNotificationTopic
+    Export:
+      Name: !Sub '${ProjectName}-sns-topic'
