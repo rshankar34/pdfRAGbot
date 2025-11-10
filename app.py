@@ -409,8 +409,8 @@ def main():
         </ol>
         <p><strong>Features:</strong></p>
         <ul>
-            <li>💰 Cost-optimized with local embeddings (FREE)</li>
-            <li>⚡ Fast retrieval with ChromaDB</li>
+            <li>💰 Cost-optimized with local embeddings with Huggingface</li>
+            <li>⚡ Fast retrieval with FAISS</li>
             <li>🤖 Powered by OpenAI for accurate answers</li>
             <li>📝 Source citations for transparency</li>
         </ul>
